@@ -39,6 +39,8 @@
 #include <zephyr/sys/util_macro.h>
 #include <zephyr/sys_clock.h>
 #include <zephyr/types.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/input/input.h>
 
 #include "stream_tx.h"
 #include "audio_i2s.h"
@@ -107,6 +109,13 @@ static const struct bt_bap_qos_cfg_pref qos_pref =
 
 static K_SEM_DEFINE(sem_disconnected, 0, 1);
 
+
+// CUSTOM GPIO DEFINITIONS (GPIO, BUTTONS, LEDS)
+#if DT_NODE_HAS_STATUS_OKAY(DT_PARENT(BUTTON_0))
+static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(button0), gpios);
+#else
+static const struct gpio_dt_spec button0;
+#endif
 
 /* ======================================================================
  * 1. ADVERTISING DATA CONFIGURATION (EXTENDED ADVERTISING)
@@ -263,6 +272,10 @@ static struct bt_bap_stream *stream_alloc(enum bt_audio_dir dir)
     return NULL;
 }
 
+// ==============================================
+// LC3 CALLBACKS
+// ==============================================
+
 static int lc3_config(struct bt_conn *conn, const struct bt_bap_ep *ep, enum bt_audio_dir dir,
               const struct bt_audio_codec_cfg *codec_cfg, struct bt_bap_stream **stream,
               struct bt_bap_qos_cfg_pref *const pref, struct bt_bap_ascs_rsp *rsp)
@@ -406,6 +419,7 @@ static int lc3_start(struct bt_bap_stream *stream, struct bt_bap_ascs_rsp *rsp)
     return 0;
 }
 
+// Helper for the metadata callback
 static bool data_func_cb(struct bt_data *data, void *user_data)
 {
     struct bt_bap_ascs_rsp *rsp = (struct bt_bap_ascs_rsp *)user_data;
@@ -445,6 +459,8 @@ static int lc3_release(struct bt_bap_stream *stream, struct bt_bap_ascs_rsp *rsp
     return 0;
 }
 
+// ========== END OF CALLBACKS ==========
+
 static struct bt_bap_unicast_server_register_param param = {
     CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT,
     CONFIG_BT_ASCS_MAX_ASE_SRC_COUNT
@@ -462,6 +478,7 @@ static const struct bt_bap_unicast_server_cb unicast_server_cb = {
     .release = lc3_release,
 };
 
+// STREAM HELPERS
 static void stream_recv_report(struct bt_bap_stream *stream,
 			       const struct bt_iso_recv_info *info,
 			       struct net_buf *buf)
@@ -610,7 +627,9 @@ static struct bt_bap_stream_ops stream_ops = {
     .started = stream_started,
     .enabled = stream_enabled_cb,
 };
+// END OF STREAM HELPERS
 
+// BLUETOOTH HELPERS
 static void connected(struct bt_conn *conn, uint8_t err)
 {
     if (err != 0) {
@@ -655,7 +674,7 @@ static struct bt_pacs_cap cap_source = {
 static int set_location(void)
 {
     int err;
-
+    // Used for stereo audio, sets which location is used for headset audio
     if (IS_ENABLED(CONFIG_BT_PAC_SNK_LOC)) {
         err = bt_pacs_set_location(BT_AUDIO_DIR_SINK,
                        (BT_AUDIO_LOCATION_FRONT_LEFT |
@@ -665,7 +684,7 @@ static int set_location(void)
             return err;
         }
     }
-
+    // Used for stereo mic, currently only supports one location
     if (IS_ENABLED(CONFIG_BT_PAC_SRC_LOC)) {
         err = bt_pacs_set_location(BT_AUDIO_DIR_SOURCE,
                        BT_AUDIO_LOCATION_FRONT_CENTER);
@@ -730,11 +749,16 @@ static int set_available_contexts(void)
     printk("Available contexts successfully set\n");
     return 0;
 }
+// END OF BLUETOOTH HELPERS
 
-/* ======================================================================
- * MAIN FUNCTION
- * ======================================================================
- */
+// ========= BUTTON CALLBACK =========
+
+/* 
+* ======================================================================
+* MAIN FUNCTION
+* ======================================================================
+*/
+
 int main(void)
 {
     struct bt_le_ext_adv *adv;
@@ -786,15 +810,17 @@ int main(void)
     bt_pacs_cap_register(BT_AUDIO_DIR_SINK, &cap_sink);
     bt_pacs_cap_register(BT_AUDIO_DIR_SOURCE, &cap_source);
 
+    // Register callbacks and number of incoming streams
     for (size_t i = 0; i < ARRAY_SIZE(sink_streams); i++) {
         bt_bap_stream_cb_register(&sink_streams[i].stream, &stream_ops);
     }
 
+    // Register callbacks and number of outgoing streams
     for (size_t i = 0; i < ARRAY_SIZE(source_streams); i++) {
         bt_bap_stream_cb_register(&source_streams[i].stream, &stream_ops);
     }
 
-    /* Configure Audio hardware mappings */
+    /* Configure Bluetooth and Audio hardware mappings */
     err = set_location();
     if (err != 0) return 0;
 

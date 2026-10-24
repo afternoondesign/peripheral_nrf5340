@@ -21,11 +21,25 @@
 	};
 };
 
+&button0 {
+		gpios = <&gpio0 24 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+		label = "Push button 1";
+		zephyr,code = <INPUT_KEY_0>;
+	};
+
 &i2s0 {
 	status = "okay";
 	pinctrl-0 = <&i2s0_default>;
 	pinctrl-1 = <&i2s0_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+&vregmain {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
+};
+
+&vregradio {
+	regulator-initial-mode = <NRF5X_REG_MODE_LDO>;
 };
 
 /* RTT is the console in this project, so release the board UART pins. */
