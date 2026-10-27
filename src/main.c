@@ -111,11 +111,10 @@ static K_SEM_DEFINE(sem_disconnected, 0, 1);
 
 
 // CUSTOM GPIO DEFINITIONS (GPIO, BUTTONS, LEDS)
-#if DT_NODE_HAS_STATUS_OKAY(DT_PARENT(BUTTON_0))
-static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(button0), gpios);
-#else
-static const struct gpio_dt_spec button0;
-#endif
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static struct gpio_callback button_cb;
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec dac_sd = GPIO_DT_SPEC_GET(DT_ALIAS(dac_sd), gpios);
 
 /* ======================================================================
  * 1. ADVERTISING DATA CONFIGURATION (EXTENDED ADVERTISING)
@@ -150,7 +149,7 @@ static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     
     /* 2. Appearance: 2066 translates to Audio Sink / Earbud */
-    BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_BYTES_LIST_LE16(2066)),
+    BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_BYTES_LIST_LE16(CONFIG_BT_DEVICE_APPEARANCE)),
     
     /* 3. UUIDs: Broadcast ASCS and CAS so the phone knows we support LE Audio */
     BT_DATA_BYTES(BT_DATA_UUID16_ALL,
@@ -751,7 +750,35 @@ static int set_available_contexts(void)
 }
 // END OF BLUETOOTH HELPERS
 
+// ====== VOLUME (VCP) CALLBACK ======
+// static void vcp_state_cb(struct bt_conn *conn, int err, uint8_t volume, uint8_t mute) {
+//     if(err) {
+//         printk("VCP state err %d\n", err);
+//         return;
+//     }
+
+// }
+// ===================================
+
 // ========= BUTTON CALLBACK =========
+static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
+    int pressed = gpio_pin_get_dt(&button);
+
+    gpio_pin_set_dt(&led, pressed);
+    printk("button %s (%d)\n", pressed ? "pressed" : "released", pressed);
+}
+int button_led_init(void)
+{
+	if (!gpio_is_ready_dt(&button) || !gpio_is_ready_dt(&led)) {
+		return -ENODEV;
+	}
+	gpio_pin_configure_dt(&button, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
+	gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
+	gpio_add_callback(button.port, &button_cb);
+    return 0;
+}
+// ===================================
 
 /* 
 * ======================================================================
@@ -761,6 +788,10 @@ static int set_available_contexts(void)
 
 int main(void)
 {
+    /* Force DAC Shutdown pin active for testing */
+    gpio_pin_configure_dt(&dac_sd, GPIO_OUTPUT_ACTIVE); // force the dac on
+    // gpio_pin_set_dt(&led, 1); // TEST: LED should be forced on at boot
+
     struct bt_le_ext_adv *adv;
     const struct bt_pacs_register_param pacs_param = {
         .snk_pac = true,
@@ -769,6 +800,13 @@ int main(void)
         .src_loc = true,
     };
     int err;
+
+    /* Initialize button and led gpios */
+    err = button_led_init();
+    if (err != 0) {
+        printk("Button and LED init failed (err%d)\n", err);
+        return 0;
+    }
 
     /* Configure I2S before advertising the matching 48 kHz LC3 capability. */
     err = audio_i2s_init();
