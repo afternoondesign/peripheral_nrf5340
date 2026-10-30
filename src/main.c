@@ -32,11 +32,13 @@
 #include <zephyr/kernel.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/sys/__assert.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/clock.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/util_macro.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/sys_clock.h>
 #include <zephyr/types.h>
 #include <zephyr/drivers/gpio.h>
@@ -86,6 +88,9 @@ struct audio_sink_lc3 {
 #endif
 
 static struct bt_conn *default_conn;
+/* VCS volume is an unsigned level from 0 (silent) to 255 (full scale). */
+static atomic_t audio_volume = ATOMIC_INIT(UINT8_MAX);
+static atomic_t audio_muted = ATOMIC_INIT(BT_VCP_STATE_UNMUTED);
 static struct audio_sink {
     struct bt_bap_stream stream;
     size_t recv_cnt;
@@ -154,7 +159,8 @@ static const struct bt_data ad[] = {
     /* 3. UUIDs: Broadcast ASCS and CAS so the phone knows we support LE Audio */
     BT_DATA_BYTES(BT_DATA_UUID16_ALL,
                   BT_UUID_16_ENCODE(BT_UUID_ASCS_VAL),
-                  BT_UUID_16_ENCODE(BT_UUID_CAS_VAL)),
+                  BT_UUID_16_ENCODE(BT_UUID_CAS_VAL),
+                  BT_UUID_16_ENCODE(BT_UUID_VCS_VAL)),
                   
     /* 4. Service Data: TMAP Role and Unicast Server specifics */
     // BT_DATA(BT_DATA_SVC_DATA16, tmap_role, ARRAY_SIZE(tmap_role)),
@@ -549,8 +555,21 @@ static void stream_recv_lc3_codec(struct bt_bap_stream *stream,
 
         if (ret < 0) {
             lc3->decode_error_cnt++;
-		} else if (audio_i2s_submit(lc3->pcm, MAX_NUM_SAMPLES) != 0) {
-			lc3->audio_drop_cnt++;
+        } else {
+            const int32_t volume = atomic_get(&audio_volume);
+            const bool muted = atomic_get(&audio_muted) != BT_VCP_STATE_UNMUTED;
+
+            /* Apply VCS volume to decoded PCM before it enters the I2S queue. */
+            for (size_t sample = 0U; sample < MAX_NUM_SAMPLES; sample++) {
+                const int32_t scaled = muted ? 0 :
+                    ((int32_t)lc3->pcm[sample] * volume) / UINT8_MAX;
+
+                lc3->pcm[sample] = (int16_t)scaled;
+            }
+
+            if (audio_i2s_submit(lc3->pcm, MAX_NUM_SAMPLES) != 0) {
+                lc3->audio_drop_cnt++;
+            }
         }
     }
 }
@@ -751,13 +770,22 @@ static int set_available_contexts(void)
 // END OF BLUETOOTH HELPERS
 
 // ====== VOLUME (VCP) CALLBACK ======
-// static void vcp_state_cb(struct bt_conn *conn, int err, uint8_t volume, uint8_t mute) {
-//     if(err) {
-//         printk("VCP state err %d\n", err);
-//         return;
-//     }
+static void vcp_state_cb(struct bt_conn *conn, int err, uint8_t volume, uint8_t mute)
+{
+    if (err != 0) {
+        printk("VCP state error %d\n", err);
+        return;
+    }
 
-// }
+    atomic_set(&audio_volume, volume);
+    atomic_set(&audio_muted, mute);
+    printk("VCP volume updated: %u/255, %s\n", volume,
+           mute == BT_VCP_STATE_MUTED ? "muted" : "unmuted");
+}
+
+static struct bt_vcp_vol_rend_cb vcp_callbacks = {
+    .state = vcp_state_cb,
+};
 // ===================================
 
 // ========= BUTTON CALLBACK =========
@@ -822,6 +850,29 @@ int main(void)
         return 0;
     }
     printk("Bluetooth initialized\n");
+
+    /* Restore bond keys and identity data before making the device discoverable. */
+    err = settings_load();
+    if (err != 0) {
+        printk("Bluetooth settings load failed (err %d)\n", err);
+        return 0;
+    }
+
+    /* Expose VCS so the phone can control the rendered audio volume. */
+    {
+        struct bt_vcp_vol_rend_register_param vcp_param = {
+            .step = 1U,
+            .mute = BT_VCP_STATE_UNMUTED,
+            .volume = UINT8_MAX,
+            .cb = &vcp_callbacks,
+        };
+
+        err = bt_vcp_vol_rend_register(&vcp_param);
+        if (err != 0) {
+            printk("VCP volume renderer registration failed (err %d)\n", err);
+            return 0;
+        }
+    }
     
     /* Register Telephony and Media Audio Profile (TMAP) */
     // err = bt_tmap_register(BT_TMAP_ROLE_UMR | BT_TMAP_ROLE_CT);
