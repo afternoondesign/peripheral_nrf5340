@@ -20,6 +20,7 @@
 #include <zephyr/bluetooth/audio/pacs.h>
 #include <zephyr/bluetooth/audio/tmap.h>
 #include <zephyr/bluetooth/audio/cap.h>
+#include <zephyr/bluetooth/audio/mcc.h>
 #include <zephyr/bluetooth/audio/vcp.h>
 #include <zephyr/bluetooth/byteorder.h>
 #include <zephyr/bluetooth/conn.h>
@@ -66,6 +67,9 @@
                   BT_AUDIO_CONTEXT_TYPE_MEDIA | \
                   BT_AUDIO_CONTEXT_TYPE_GAME)
 
+#define BUTTON_DOUBLE_PRESS_WINDOW_MS 350U
+#define BUTTON_DEBOUNCE_MS 30U
+
 NET_BUF_POOL_FIXED_DEFINE(tx_pool, CONFIG_BT_ASCS_MAX_ASE_SRC_COUNT,
               BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
               CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
@@ -88,6 +92,13 @@ struct audio_sink_lc3 {
 #endif
 
 static struct bt_conn *default_conn;
+static struct k_spinlock conn_lock;
+static atomic_t mcs_ready = ATOMIC_INIT(0);
+static atomic_t button_press_count = ATOMIC_INIT(0);
+static atomic_t media_toggle_pending = ATOMIC_INIT(0);
+static bool button_stable_pressed;
+static struct k_work_delayable button_debounce_work;
+static struct k_work_delayable button_click_work;
 /* VCS volume is an unsigned level from 0 (silent) to 255 (full scale). */
 static atomic_t audio_volume = ATOMIC_INIT(UINT8_MAX);
 static atomic_t audio_muted = ATOMIC_INIT(BT_VCP_STATE_UNMUTED);
@@ -648,30 +659,202 @@ static struct bt_bap_stream_ops stream_ops = {
 // END OF STREAM HELPERS
 
 // BLUETOOTH HELPERS
+static struct bt_conn *media_conn_ref(void)
+{
+    k_spinlock_key_t key = k_spin_lock(&conn_lock);
+    struct bt_conn *conn = default_conn;
+
+    if (conn != NULL) {
+        bt_conn_ref(conn);
+    }
+    k_spin_unlock(&conn_lock, key);
+
+    return conn;
+}
+
+static bool media_conn_is_current(struct bt_conn *conn)
+{
+    k_spinlock_key_t key = k_spin_lock(&conn_lock);
+    const bool is_current = conn != NULL && conn == default_conn;
+
+    k_spin_unlock(&conn_lock, key);
+    return is_current;
+}
+
+static void send_media_command(struct bt_conn *conn, uint8_t opcode)
+{
+    const struct mpl_cmd cmd = {
+        .opcode = opcode,
+        .use_param = false,
+    };
+    const int err = bt_mcc_send_cmd(conn, &cmd);
+
+    if (err != 0) {
+        printk("MCP command 0x%02x failed to queue (%d)\n", opcode, err);
+    }
+}
+
+static void mcc_discover_mcs_cb(struct bt_conn *conn, int err)
+{
+    if (!media_conn_is_current(conn)) {
+        return;
+    }
+
+    if (err != 0) {
+        printk("MCP: phone MCS discovery failed (%d); media button commands unavailable\n",
+               err);
+        atomic_set(&mcs_ready, 0);
+        return;
+    }
+
+    printk("MCP: phone MCS discovered; media button commands ready\n");
+    atomic_set(&mcs_ready, 1);
+}
+
+static void mcc_media_state_cb(struct bt_conn *conn, int err, uint8_t state)
+{
+    if (!atomic_cas(&media_toggle_pending, 1, 0)) {
+        return;
+    }
+
+    if (err != 0 || !media_conn_is_current(conn) || !atomic_get(&mcs_ready)) {
+        printk("MCP: unable to read media state for play/pause (%d)\n", err);
+        return;
+    }
+
+    send_media_command(conn, state == MEDIA_PROXY_STATE_PLAYING ?
+                       MEDIA_PROXY_OP_PAUSE : MEDIA_PROXY_OP_PLAY);
+}
+
+static void mcc_send_cmd_cb(struct bt_conn *conn, int err, const struct mpl_cmd *cmd)
+{
+    if (err != 0) {
+        printk("MCP: media command 0x%02x failed (%d)\n", cmd->opcode, err);
+    }
+}
+
+static struct bt_mcc_cb mcc_callbacks = {
+    .discover_mcs = mcc_discover_mcs_cb,
+    .read_media_state = mcc_media_state_cb,
+    .send_cmd = mcc_send_cmd_cb,
+};
+
+/* This handler dispatches commands to the phone, add additional commands here! */
+static void button_click_work_handler(struct k_work *work)
+{
+    const atomic_val_t press_count = atomic_set(&button_press_count, 0);
+    struct bt_conn *conn;
+
+    ARG_UNUSED(work);
+
+    if (press_count <= 0) {
+        return;
+    }
+
+    if (!atomic_get(&mcs_ready)) {
+        printk("Button media action ignored: phone MCS is not ready\n");
+        return;
+    }
+
+    conn = media_conn_ref();
+    if (conn == NULL) {
+        printk("Button media action ignored: no phone connection\n");
+        return;
+    }
+
+    if (press_count == 1) {
+        atomic_set(&media_toggle_pending, 1);
+        const int err = bt_mcc_read_media_state(conn);
+
+        if (err != 0) {
+            atomic_set(&media_toggle_pending, 0);
+            printk("MCP media-state read failed (%d)\n", err);
+        }
+    } else {
+        send_media_command(conn, MEDIA_PROXY_OP_NEXT_TRACK);
+    }
+
+    bt_conn_unref(conn);
+}
+
+static void button_click_work_init(void)
+{
+    k_work_init_delayable(&button_click_work, button_click_work_handler);
+}
+
+static void button_debounce_work_handler(struct k_work *work)
+{
+    int pressed = gpio_pin_get_dt(&button);
+
+    ARG_UNUSED(work);
+
+    if (pressed < 0) {
+        printk("Could not read button state (%d)\n", pressed);
+        return;
+    }
+
+    /* Accept a transition only after the pin has remained stable for the debounce interval. */
+    if ((pressed != 0) == button_stable_pressed) {
+        return;
+    }
+
+    button_stable_pressed = pressed != 0;
+    gpio_pin_set_dt(&led, button_stable_pressed);
+
+    if (button_stable_pressed) {
+        atomic_inc(&button_press_count);
+        (void)k_work_reschedule(&button_click_work,
+                                K_MSEC(BUTTON_DOUBLE_PRESS_WINDOW_MS));
+        printk("button pressed\n");
+    } else {
+        printk("button released\n");
+    }
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
+    k_spinlock_key_t key;
+
     if (err != 0) {
         printk("Failed to connect to %s %u %s\n", bt_conn_dst_str(conn),
                err, bt_hci_err_to_str(err));
-        default_conn = NULL;
         return;
     }
 
     printk("Connected: %s\n", bt_conn_dst_str(conn));
+    key = k_spin_lock(&conn_lock);
     default_conn = bt_conn_ref(conn);
+    k_spin_unlock(&conn_lock, key);
+
+    atomic_set(&mcs_ready, 0);
+    atomic_set(&media_toggle_pending, 0);
+    err = bt_mcc_discover_mcs(conn, false);
+    if (err != 0) {
+        printk("MCP: could not start phone MCS discovery (%d)\n", err);
+    }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    if (conn != default_conn) {
+    k_spinlock_key_t key = k_spin_lock(&conn_lock);
+    struct bt_conn *disconnected_conn = NULL;
+
+    if (conn == default_conn) {
+        disconnected_conn = default_conn;
+        default_conn = NULL;
+    }
+    k_spin_unlock(&conn_lock, key);
+
+    if (disconnected_conn == NULL) {
         return;
     }
 
     printk("Disconnected: %s, reason 0x%02x %s\n", bt_conn_dst_str(conn),
            reason, bt_hci_err_to_str(reason));
 
-    bt_conn_unref(default_conn);
-    default_conn = NULL;
+    bt_conn_unref(disconnected_conn);
+    atomic_set(&mcs_ready, 0);
+    atomic_set(&media_toggle_pending, 0);
 
     k_sem_give(&sem_disconnected);
 }
@@ -790,20 +973,43 @@ static struct bt_vcp_vol_rend_cb vcp_callbacks = {
 
 // ========= BUTTON CALLBACK =========
 static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins) {
-    int pressed = gpio_pin_get_dt(&button);
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cb);
+    ARG_UNUSED(pins);
 
-    gpio_pin_set_dt(&led, pressed);
-    printk("button %s (%d)\n", pressed ? "pressed" : "released", pressed);
+    /* GPIO interrupts can chatter; debounce it until the level settles. */
+    (void)k_work_reschedule(&button_debounce_work, K_MSEC(BUTTON_DEBOUNCE_MS));
 }
 int button_led_init(void)
 {
 	if (!gpio_is_ready_dt(&button) || !gpio_is_ready_dt(&led)) {
 		return -ENODEV;
 	}
-	gpio_pin_configure_dt(&button, GPIO_INPUT);
-	gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
+    int err = gpio_pin_configure_dt(&button, GPIO_INPUT);
+    if (err != 0) {
+        return err;
+    }
+    err = gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+    if (err != 0) {
+        return err;
+    }
+    int pressed = gpio_pin_get_dt(&button);
+    if (pressed < 0) {
+        return pressed;
+    }
+    button_stable_pressed = pressed != 0;
+    gpio_pin_set_dt(&led, button_stable_pressed);
+    k_work_init_delayable(&button_debounce_work, button_debounce_work_handler);
+    button_click_work_init();
 	gpio_init_callback(&button_cb, button_pressed, BIT(button.pin));
-	gpio_add_callback(button.port, &button_cb);
+    err = gpio_add_callback(button.port, &button_cb);
+    if (err != 0) {
+        return err;
+    }
+    err = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_BOTH);
+    if (err != 0) {
+        return err;
+    }
     return 0;
 }
 // ===================================
@@ -855,6 +1061,13 @@ int main(void)
     err = settings_load();
     if (err != 0) {
         printk("Bluetooth settings load failed (err %d)\n", err);
+        return 0;
+    }
+
+    /* Initialize the Media Control Client once; discover the phone's MCS per connection. */
+    err = bt_mcc_init(&mcc_callbacks);
+    if (err != 0) {
+        printk("MCP client initialization failed (err %d)\n", err);
         return 0;
     }
 

@@ -1,6 +1,6 @@
 ## To-do
 [x] Add volume control - VCP, VCS, and VOCS
-[ ] Add media control (play/pause, skip forward, skip back) - TMAP
+[x] Add media control (play/pause, skip forward, skip back) - TMAP
 [x] Get bluetooth reconnect working so I don't have to delete bond info every time (added bluetooth settings to save bond keys)
 [ ] Add microphone support - MICP
 [ ] Dual earbud support - CSIP
